@@ -43,6 +43,12 @@ class ConfigIssue:
 _MANAGED_LITELLM_KEY_PROVIDERS = {"gemini", "vertex_ai", "anthropic", "openai", "deepseek"}
 SUPPORTED_LLM_CHANNEL_PROTOCOLS = ("openai", "anthropic", "gemini", "vertex_ai", "deepseek", "ollama")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
+NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
+    "ultra_short": 1,
+    "short": 3,
+    "medium": 7,
+    "long": 30,
+}
 
 
 def parse_env_bool(value: Optional[str], default: bool = False) -> bool:
@@ -53,6 +59,19 @@ def parse_env_bool(value: Optional[str], default: bool = False) -> bool:
     if not normalized:
         return default
     return normalized not in _FALSEY_ENV_VALUES
+
+
+def normalize_news_strategy_profile(value: Optional[str]) -> str:
+    """Normalize news strategy profile to known values."""
+    candidate = (value or "short").strip().lower()
+    return candidate if candidate in NEWS_STRATEGY_WINDOWS else "short"
+
+
+def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Optional[str]) -> int:
+    """Resolve effective news window days from profile and global max-age."""
+    profile = normalize_news_strategy_profile(news_strategy_profile)
+    profile_days = NEWS_STRATEGY_WINDOWS.get(profile, NEWS_STRATEGY_WINDOWS["short"])
+    return max(1, min(max(1, int(news_max_age_days)), profile_days))
 
 
 def canonicalize_llm_channel_protocol(value: Optional[str]) -> str:
@@ -329,8 +348,13 @@ class Config:
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
 
+    # === Social Sentiment (US stocks only, api.adanos.org) ===
+    social_sentiment_api_key: Optional[str] = None
+    social_sentiment_api_url: str = "https://api.adanos.org"
+
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
+    news_strategy_profile: str = "short"  # 新闻窗口策略档位：ultra_short/short/medium/long
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === Agent 模式配置 ===
@@ -506,6 +530,14 @@ class Config:
     fundamental_cache_ttl_seconds: int = 120
     # 基本面缓存最大条目数（避免长时间运行内存增长）
     fundamental_cache_max_entries: int = 256
+
+    # === Portfolio PR2: import/risk/fx settings ===
+    portfolio_risk_concentration_alert_pct: float = 35.0
+    portfolio_risk_drawdown_alert_pct: float = 15.0
+    portfolio_risk_stop_loss_alert_pct: float = 10.0
+    portfolio_risk_stop_loss_near_ratio: float = 0.8
+    portfolio_risk_lookback_days: int = 180
+    portfolio_fx_update_enabled: bool = True
 
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
@@ -826,6 +858,22 @@ class Config:
         else:
             # 未显式配置时，根据消息类型选择默认字节数
             wechat_max_bytes = 2048 if wechat_msg_type_lower == 'text' else 4000
+
+        # Preserve historical semantics for startup flags: only an explicit
+        # literal "true" enables immediate execution; empty strings stay False.
+        legacy_run_immediately_env = os.getenv('RUN_IMMEDIATELY')
+        legacy_run_immediately = (
+            legacy_run_immediately_env.lower() == 'true'
+            if legacy_run_immediately_env is not None
+            else True
+        )
+
+        schedule_run_immediately_env = os.getenv('SCHEDULE_RUN_IMMEDIATELY')
+        schedule_run_immediately = (
+            schedule_run_immediately_env.lower() == 'true'
+            if schedule_run_immediately_env is not None
+            else legacy_run_immediately
+        )
         
         return cls(
             stock_list=stock_list,
@@ -881,7 +929,12 @@ class Config:
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
+            social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
+            social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=max(1, int(os.getenv('NEWS_MAX_AGE_DAYS', '3'))),
+            news_strategy_profile=cls._parse_news_strategy_profile(
+                os.getenv('NEWS_STRATEGY_PROFILE', 'short')
+            ),
             bias_threshold=max(1.0, float(os.getenv('BIAS_THRESHOLD', '5.0'))),
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
@@ -920,7 +973,10 @@ class Config:
             custom_webhook_bearer_token=os.getenv('CUSTOM_WEBHOOK_BEARER_TOKEN'),
             webhook_verify_ssl=os.getenv('WEBHOOK_VERIFY_SSL', 'true').lower() == 'true',
             discord_bot_token=os.getenv('DISCORD_BOT_TOKEN'),
-            discord_main_channel_id=os.getenv('DISCORD_MAIN_CHANNEL_ID'),
+            discord_main_channel_id=(
+                os.getenv('DISCORD_MAIN_CHANNEL_ID')
+                or os.getenv('DISCORD_CHANNEL_ID')
+            ),
             discord_webhook_url=os.getenv('DISCORD_WEBHOOK_URL'),
             astrbot_url=os.getenv('ASTRBOT_URL'),
             astrbot_token=os.getenv('ASTRBOT_TOKEN'),
@@ -962,8 +1018,8 @@ class Config:
             https_proxy=os.getenv('HTTPS_PROXY'),
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
-            schedule_run_immediately=os.getenv('SCHEDULE_RUN_IMMEDIATELY', 'true').lower() == 'true',
-            run_immediately=os.getenv('RUN_IMMEDIATELY', 'true').lower() == 'true',
+            schedule_run_immediately=schedule_run_immediately,
+            run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
             market_review_region=cls._parse_market_review_region(
                 os.getenv('MARKET_REVIEW_REGION', 'cn')
@@ -1020,7 +1076,21 @@ class Config:
             ),
             fundamental_retry_max=int(os.getenv('FUNDAMENTAL_RETRY_MAX', '1')),
             fundamental_cache_ttl_seconds=int(os.getenv('FUNDAMENTAL_CACHE_TTL_SECONDS', '120')),
-            fundamental_cache_max_entries=int(os.getenv('FUNDAMENTAL_CACHE_MAX_ENTRIES', '256'))
+            fundamental_cache_max_entries=int(os.getenv('FUNDAMENTAL_CACHE_MAX_ENTRIES', '256')),
+            portfolio_risk_concentration_alert_pct=float(
+                os.getenv('PORTFOLIO_RISK_CONCENTRATION_ALERT_PCT', '35.0')
+            ),
+            portfolio_risk_drawdown_alert_pct=float(
+                os.getenv('PORTFOLIO_RISK_DRAWDOWN_ALERT_PCT', '15.0')
+            ),
+            portfolio_risk_stop_loss_alert_pct=float(
+                os.getenv('PORTFOLIO_RISK_STOP_LOSS_ALERT_PCT', '10.0')
+            ),
+            portfolio_risk_stop_loss_near_ratio=float(
+                os.getenv('PORTFOLIO_RISK_STOP_LOSS_NEAR_RATIO', '0.8')
+            ),
+            portfolio_risk_lookback_days=int(os.getenv('PORTFOLIO_RISK_LOOKBACK_DAYS', '180')),
+            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true'
         )
     
     @classmethod
@@ -1278,6 +1348,26 @@ class Config:
             f"REPORT_TYPE '{value}' invalid, fallback to 'simple' (valid: simple/full/brief)"
         )
         return 'simple'
+
+    @classmethod
+    def _parse_news_strategy_profile(cls, value: Optional[str]) -> str:
+        """Parse NEWS_STRATEGY_PROFILE, fallback to short for invalid values."""
+        normalized = normalize_news_strategy_profile(value)
+        raw = (value or "short").strip().lower()
+        if raw != normalized:
+            logging.getLogger(__name__).warning(
+                "NEWS_STRATEGY_PROFILE '%s' invalid, fallback to 'short' "
+                "(valid: ultra_short/short/medium/long)",
+                value,
+            )
+        return normalized
+
+    def get_effective_news_window_days(self) -> int:
+        """Return effective news window days after profile + max-age merge."""
+        return resolve_news_window_days(
+            news_max_age_days=self.news_max_age_days,
+            news_strategy_profile=self.news_strategy_profile,
+        )
 
     @classmethod
     def _parse_market_review_region(cls, value: str) -> str:
